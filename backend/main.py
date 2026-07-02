@@ -5,6 +5,7 @@ from fastapi.staticfiles import StaticFiles
 import os
 import asyncio
 import logging
+import time
 from pathlib import Path
 from typing import Optional
 import aiofiles
@@ -28,8 +29,8 @@ app = FastAPI(title="AI视频转录器", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,          # era True: invalido con origins=["*"]
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -50,10 +51,8 @@ summarizer = Summarizer()
 translator = Translator()
 
 # 存储任务状态 - 使用文件持久化
-import threading
-
 TASKS_FILE = TEMP_DIR / "tasks.json"
-tasks_lock = threading.Lock()
+_save_lock = asyncio.Lock()
 
 def load_tasks():
     """加载任务状态"""
@@ -61,18 +60,24 @@ def load_tasks():
         if TASKS_FILE.exists():
             with open(TASKS_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
-    except:
+    except Exception:
         pass
     return {}
 
-def save_tasks(tasks_data):
-    """保存任务状态"""
-    try:
-        with tasks_lock:
-            with open(TASKS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(tasks_data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"保存任务状态失败: {e}")
+def _atomic_write(payload: str) -> None:
+    tmp = TASKS_FILE.with_suffix(".tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.replace(TASKS_FILE)          # rename atomico: mai un file mezzo scritto
+
+async def save_tasks_async(tasks_data: dict) -> None:
+    async with _save_lock:
+        # serializzazione nell'event loop (ms, e coerente: nessuna coroutine può mutare
+        # il dict durante json.dumps); solo l'I/O va nel thread
+        try:
+            payload = json.dumps(tasks_data, ensure_ascii=False, indent=2)
+            await asyncio.to_thread(_atomic_write, payload)
+        except Exception as e:
+            logger.error(f"保存任务状态失败: {e}")
 
 async def broadcast_task_update(task_id: str, task_data: dict):
     """向所有连接的SSE客户端广播任务状态更新"""
@@ -107,6 +112,31 @@ sse_connections = {}
 # 本地上传：允许的类型与大小上限（MB），可用环境变量 UPLOAD_MAX_MB 调整
 UPLOAD_ALLOWED_EXT = frozenset({".txt", ".mp3", ".mp4", ".m4a", ".wav", ".webm", ".mkv", ".ogg", ".flac"})
 UPLOAD_MAX_MB = int(os.getenv("UPLOAD_MAX_MB", "200"))
+
+# Cleanup automatico: file temp più vecchi di N ore + prune dei task terminati
+TEMP_MAX_AGE_H = int(os.getenv("TEMP_MAX_AGE_HOURS", "24"))
+MAX_FINISHED_TASKS = 100
+
+async def _periodic_cleanup(interval_h: float = 6.0):
+    while True:
+        try:
+            cutoff = time.time() - TEMP_MAX_AGE_H * 3600
+            for p in TEMP_DIR.iterdir():
+                if p.name != "tasks.json" and p.is_file() and p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
+            # pota i task terminati oltre i più recenti N (i dict preservano l'ordine di inserimento)
+            finished = [tid for tid, t in tasks.items()
+                        if t.get("status") in ("completed", "error")]
+            for tid in finished[:-MAX_FINISHED_TASKS] if len(finished) > MAX_FINISHED_TASKS else []:
+                tasks.pop(tid, None)
+            await save_tasks_async(tasks)
+        except Exception as e:
+            logger.warning(f"cleanup periodico fallito: {e}")
+        await asyncio.sleep(interval_h * 3600)
+
+@app.on_event("startup")
+async def _start_cleanup():
+    asyncio.create_task(_periodic_cleanup())
 
 
 def _sanitize_title_for_filename(title: str) -> str:
@@ -158,7 +188,7 @@ async def _run_post_extract_pipeline(
         with open(raw_md_path, "w", encoding="utf-8") as f:
             f.write((raw_script or "") + f"\n\nsource: {source_ref}\n")
         tasks[task_id].update({"raw_script_file": raw_md_filename})
-        save_tasks(tasks)
+        await save_tasks_async(tasks)
         await broadcast_task_update(task_id, tasks[task_id])
     except Exception as e:
         logger.error(f"保存原始转录Markdown失败: {e}")
@@ -167,7 +197,7 @@ async def _run_post_extract_pipeline(
         "progress": 55,
         "message": "正在优化转录文本...",
     })
-    save_tasks(tasks)
+    await save_tasks_async(tasks)
     await broadcast_task_update(task_id, tasks[task_id])
 
     script = await request_summarizer.optimize_transcript(raw_script)
@@ -207,7 +237,7 @@ async def _run_post_extract_pipeline(
             "progress": 70,
             "message": "正在生成翻译...",
         })
-        save_tasks(tasks)
+        await save_tasks_async(tasks)
         await broadcast_task_update(task_id, tasks[task_id])
 
         translation_content = await request_translator.translate_text(
@@ -228,7 +258,7 @@ async def _run_post_extract_pipeline(
         "progress": 80,
         "message": "正在生成摘要...",
     })
-    save_tasks(tasks)
+    await save_tasks_async(tasks)
     await broadcast_task_update(task_id, tasks[task_id])
 
     summary = await request_summarizer.summarize(script, summary_language, video_title)
@@ -276,7 +306,7 @@ async def _run_post_extract_pipeline(
         })
 
     tasks[task_id].update(task_result)
-    save_tasks(tasks)
+    await save_tasks_async(tasks)
     logger.info(f"任务完成，准备广播最终状态: {task_id}")
     await broadcast_task_update(task_id, tasks[task_id])
     logger.info(f"最终状态已广播: {task_id}")
@@ -376,7 +406,7 @@ async def _enqueue_upload_job(
         "error": None,
         "url": source_label,
     }
-    save_tasks(tasks)
+    await save_tasks_async(tasks)
 
     bg = asyncio.create_task(
         process_upload_task(
@@ -447,7 +477,7 @@ async def process_video(
             "error": None,
             "url": url  # 保存URL用于去重
         }
-        save_tasks(tasks)
+        await save_tasks_async(tasks)
         
         # 创建并跟踪异步任务
         task = asyncio.create_task(process_video_task(task_id, url, summary_language, api_key, model_base_url, model_id))
@@ -479,7 +509,7 @@ async def process_video_task(
             "progress": 10,
             "message": "正在检测视频字幕..."
         })
-        save_tasks(tasks)
+        await save_tasks_async(tasks)
         await broadcast_task_update(task_id, tasks[task_id])
         await asyncio.sleep(0.1)
 
@@ -508,7 +538,7 @@ async def process_video_task(
                 "progress": 40,
                 "message": f"字幕获取成功（{sub_lang}），正在处理文本..."
             })
-            save_tasks(tasks)
+            await save_tasks_async(tasks)
             await broadcast_task_update(task_id, tasks[task_id])
         else:
             # ── 慢速路径：无字幕，下载音频 → Whisper 转录 ─────────────────
@@ -516,7 +546,7 @@ async def process_video_task(
                 "progress": 15,
                 "message": "未找到字幕，正在下载视频音频..."
             })
-            save_tasks(tasks)
+            await save_tasks_async(tasks)
             await broadcast_task_update(task_id, tasks[task_id])
 
             audio_path, video_title = await video_processor.download_and_convert(
@@ -527,14 +557,14 @@ async def process_video_task(
                 "progress": 35,
                 "message": "音频下载完成，准备转录..."
             })
-            save_tasks(tasks)
+            await save_tasks_async(tasks)
             await broadcast_task_update(task_id, tasks[task_id])
 
             tasks[task_id].update({
                 "progress": 40,
                 "message": "正在转录音频（Whisper）..."
             })
-            save_tasks(tasks)
+            await save_tasks_async(tasks)
             await broadcast_task_update(task_id, tasks[task_id])
 
             raw_script = await transcriber.transcribe(audio_path)
@@ -569,7 +599,7 @@ async def process_video_task(
             "error": str(e),
             "message": f"处理失败: {str(e)}"
         })
-        save_tasks(tasks)
+        await save_tasks_async(tasks)
         await broadcast_task_update(task_id, tasks[task_id])
 
 @app.post("/api/process-upload")
@@ -617,7 +647,7 @@ async def process_upload_task(
                 "progress": 20,
                 "message": "正在读取文本文件...",
             })
-            save_tasks(tasks)
+            await save_tasks_async(tasks)
             await broadcast_task_update(task_id, tasks[task_id])
 
             body = saved_path.read_text(encoding="utf-8", errors="replace")
@@ -630,7 +660,7 @@ async def process_upload_task(
                 "progress": 15,
                 "message": "正在转换音频格式...",
             })
-            save_tasks(tasks)
+            await save_tasks_async(tasks)
             await broadcast_task_update(task_id, tasks[task_id])
 
             audio_path = await video_processor.normalize_local_media_to_m4a(saved_path, TEMP_DIR)
@@ -639,14 +669,14 @@ async def process_upload_task(
                 "progress": 35,
                 "message": "音频准备完成，准备转录...",
             })
-            save_tasks(tasks)
+            await save_tasks_async(tasks)
             await broadcast_task_update(task_id, tasks[task_id])
 
             tasks[task_id].update({
                 "progress": 40,
                 "message": "正在转录音频（Whisper）...",
             })
-            save_tasks(tasks)
+            await save_tasks_async(tasks)
             await broadcast_task_update(task_id, tasks[task_id])
 
             raw_script = await transcriber.transcribe(audio_path)
@@ -673,7 +703,7 @@ async def process_upload_task(
             "error": str(e),
             "message": f"处理失败: {str(e)}",
         })
-        save_tasks(tasks)
+        await save_tasks_async(tasks)
         await broadcast_task_update(task_id, tasks[task_id])
 
 

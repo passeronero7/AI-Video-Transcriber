@@ -3,7 +3,7 @@ import os
 import re
 from typing import Optional
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from llm_sanitize import strip_llm_artifacts
 
@@ -53,7 +53,7 @@ class Translator:
             return
 
         try:
-            self.client = OpenAI(api_key=eff_key, base_url=eff_base)
+            self.client = AsyncOpenAI(api_key=eff_key, base_url=eff_base)
             logger.info("Translator OpenAI 客户端初始化成功")
         except Exception as e:
             logger.error(f"初始化 OpenAI 客户端失败: {e}")
@@ -246,7 +246,7 @@ class Translator:
 只返回翻译结果，不要添加任何说明。"""
 
         try:
-            response = self.client.chat.completions.create(
+            response = await self.client.chat.completions.create(
                 model=self._translation_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -290,7 +290,7 @@ class Translator:
 只返回翻译结果。"""
 
             try:
-                response = self.client.chat.completions.create(
+                response = await self.client.chat.completions.create(
                     model=self._translation_model,
                     messages=[
                         {"role": "system", "content": system_prompt},
